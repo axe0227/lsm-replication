@@ -1,76 +1,195 @@
+#include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <sys/types.h>
 #include <sys/inotify.h>
+#include <unistd.h>
+#include <string.h>
 
-#define EVENT_SIZE  ( sizeof (struct inotify_event) )
-#define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
+/* Read all available inotify events from the file descriptor 'fd'.
+  wd is the table of watch descriptors for the directories in argv.
+  argc is the length of wd and argv.
+  argv is the list of watched directories.
+  Entry 0 of wd and argv is unused. */
 
-int main(int argc, char **argv)
+static void
+handle_events(int fd)
 {
+    /* Some systems cannot read integer variables if they are not
+      properly aligned. On other systems, incorrect alignment may
+      decrease performance. Hence, the buffer used for reading from
+      the inotify file descriptor should have the same alignment as
+      struct inotify_event. */
 
-  int length, i = 0;
-  int fd;
-  int wd;
-  char buffer[EVENT_BUF_LEN];
+    char buf[4096]
+        __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    const struct inotify_event *event;
+    ssize_t len;
 
- if(argc != 2){
-     perror("usage : ./filewatcher [the path of the directory to watch] \n");
-     exit(1);
- }
-  /*creating the INOTIFY instance*/
-  fd = inotify_init();
+    /* Loop while events can be read from inotify file descriptor. */
 
-  /*checking for error*/
-  if ( fd < 0 ) {
-    perror( "inotify_init" );
-    exit(1);
-  }
+    for (;;) {
 
-  /*adding the “/tmp” directory into watch list. Here, the suggestion is to validate the existence of the directory before adding into monitoring list.*/
-  wd = inotify_add_watch( fd, argv[1], IN_CREATE | IN_DELETE | IN_MODIFY);
-
-    printf("path to the dir to read: %s. \n", argv[1]);
-  /*read to determine the event change happens on the directory. Actually this read blocks until the change event occurs*/ 
-
-    // printf(" before reading \n");
-  length = read( fd, buffer, EVENT_BUF_LEN ); 
-    printf("length : %d\n", length);
-  /*checking for error*/
-  if ( length < 0 ) {
-    perror( "read" );
-  }  
-
-  /*actually read return the list of change events happens. Here, read the change event one by one and process it accordingly.*/
-  while ( i < length ) {    
-
-    struct inotify_event *event = ( struct inotify_event *)&buffer[i]; 
-
-    if ( event->len ) {
-
-        printf(" event length :  %d \n", event->len);
-      if ( event->mask & IN_CREATE ) {
-    
-          printf( "New file %s created.\n", event->name );
+        /* Read some events. */
+        len = read(fd, buf, sizeof(buf));
         
-      }
-      else if ( event->mask & IN_DELETE ) {
-       
-          printf( "File %s deleted.\n", event->name );
-    
-      }
-      else if(event->mask & IN_MODIFY){
-          printf("File %s modified. \n", event->name);
-      }
+        if (len == -1 && errno != EAGAIN) {
+            perror("read");
+            exit(EXIT_FAILURE);
+        }
 
+        /* If the nonblocking read() found no events to read, then
+          it returns -1 with errno set to EAGAIN. In that case,
+          we exit the loop. */
+
+        if (len <= 0)
+            break;
+
+        /* Loop over all events in the buffer */
+
+        for (char *ptr = buf; ptr < buf + len;
+                ptr += sizeof(struct inotify_event) + event->len) {
+            
+            event = (const struct inotify_event *) ptr;
+            printf("buffer content : %d \n", event->wd);
+
+            /* Print event type */
+
+            // if (event->mask & IN_OPEN)
+                // printf("IN_OPEN: ");
+            // if (event->mask & IN_CLOSE_NOWRITE)
+                // printf("IN_CLOSE_NOWRITE: ");
+            // if (event->mask & IN_CLOSE_WRITE)
+                // printf("IN_CLOSE_WRITE: ");
+            if(event->mask & IN_CREATE)
+                 printf( "IN_CREATE: " );
+
+            if(event->mask & IN_MODIFY)
+                 printf("IN_MODIFY: ");
+
+            if(event->mask & IN_DELETE)
+                 printf("IN_DELETE: ");
+
+            /* Print the name of the watched directory */
+
+            // for (int i = 1; i < argc; ++i) {
+            //     if (wd[i] == event->wd) {
+            //         printf("%s/", argv[i]);
+            //         break;
+            //     }
+            // }
+
+            /* Print the name of the file */
+            if (event->len)
+                printf("%s \n", event->name);
+
+            /* Print type of filesystem object */
+
+            // if (event->mask & IN_ISDIR)
+            //     printf(" [directory]\n");
+            // else
+            //     printf(" [file]\n");
+        }
     }
-    i += EVENT_SIZE + event->len;
-  }
-  /*removing the “/tmp” directory from the watch list.*/
-   inotify_rm_watch( fd, wd );
+}
 
-  /*closing the INOTIFY instance*/
-   close( fd );
+int main(int argc, char* argv[])
+{
+    char buf;
+    int fd, i, poll_num;
+    int *wd;
+    nfds_t nfds;
+    struct pollfd fds[2];
 
+    if (argc < 2) {
+        printf("Usage: %s PATH [PATH ...]\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Press ENTER key to terminate.\n");
+
+    /* Create the file descriptor for accessing the inotify API */
+
+    fd = inotify_init1(IN_NONBLOCK);
+    if (fd == -1) {
+        perror("inotify_init1");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Allocate memory for watch descriptors */
+
+    wd = calloc(argc, sizeof(int));
+    if (wd == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Mark directories for events
+      - file was created
+      - file was modified 
+      - filewas deleted */
+
+    for (i = 1; i < argc; i++) {
+        wd[i] = inotify_add_watch(fd, argv[i],
+                                  IN_CREATE | IN_MODIFY | IN_DELETE);
+        if (wd[i] == -1) {
+            fprintf(stderr, "Cannot watch '%s': %s\n",
+                    argv[i], strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Prepare for polling */
+
+    nfds = 2;
+
+    /* Console input */
+
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+
+    /* Inotify input */
+
+    fds[1].fd = fd;
+    fds[1].events = POLLIN;
+
+    /* Wait for events and/or terminal input */
+
+    printf("Listening for events.\n");
+    while (1) {
+
+        poll_num = poll(fds, nfds, -1);
+        if (poll_num == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+
+        if (poll_num > 0) {
+
+            if (fds[0].revents & POLLIN) {
+
+                /* Console input is available. Empty stdin and quit */
+                while (read(STDIN_FILENO, &buf, 1) > 0 && buf != '\n')
+                    continue;
+                break;
+            }
+
+            if (fds[1].revents & POLLIN) {
+
+                /* Inotify events are available */
+                handle_events(fd);
+            }
+        }
+    }
+
+    printf("Listening for events stopped.\n");
+
+    /* Close inotify file descriptor */
+
+    close(fd);
+
+    free(wd);
+    exit(EXIT_SUCCESS);
 }
